@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+*.stil
+*.stil.gz
+*.pin
+*.PIN
+reports/
+local-*
+*.log
