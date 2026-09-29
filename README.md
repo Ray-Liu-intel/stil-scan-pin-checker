@@ -6,10 +6,11 @@ A reusable Copilot skill and standalone Python CLI for checking STIL scan-data p
 
 - Reads `.stil` and `.stil.gz` without modifying or extracting inputs to disk.
 - Extracts declared `ScanIn` and `ScanOut` from every `ScanStructures / ScanChain` block.
-- Tests membership in the **union** of three pin groups (defaults: `stm_scan_in`, `stm_scan_out`, `stm_scan_nonclk_dpin`). Direction matching is intentionally not required.
+- Requires **direction matching** in the base check for both body and setup: ScanIn must be in `stm_scan_in` or `stm_scan_nonclk_dpin`; ScanOut must be in `stm_scan_out` or `stm_scan_nonclk_dpin`. The dpin group is direction-free. Pins only in the opposite scan group fail with DIRECTION_MISMATCH; pins in none of these groups fail with PIN_NOT_FOUND.
 - Converts names to uppercase and bus indices `[n]` to `_n`. Example: `"data_bus"[2]` becomes `DATA_BUS_2`.
 - Reports chain names, decompressed line numbers, normalized/original pins and matching groups as JSON.
 - Records clocks and absent ScanIn/ScanOut declarations as informational observations.
+- Classifies body patterns using scan-in/out-only membership; optionally copies eligible files to versioned Channellink folders without changing originals.
 
 **It does not validate TCK, scan-clock period, frequency, duty cycle, pattern execution, electrical correctness or tester readiness.** Missing declarations alone do not fail membership. Empty/unreadable/unsupported inputs cannot pass.
 
@@ -38,7 +39,29 @@ python scripts/check_scan_pins.py /path/to/patterns --plt-dir /path/to/PLT --sta
 python scripts/check_scan_pins.py /path/to/patterns --pin-file /path/to/target.pin --groups scan_in scan_out scan_nonclk_dpin
 ```
 
-Input directories are recursive. Only `.stil` / `.stil.gz` files are processed. Use your selected interpreter instead of `python` if needed.
+Input directories are recursive. Only `.stil` / `.stil.gz` files are processed. Generated `_Channellink` directories and `_CHL` files are excluded to avoid processing outputs on repeat runs. Use your selected interpreter instead of `python` if needed.
+
+### Body classification and Channellink copies
+
+```shell
+# Preview only (no file creation)
+python scripts/check_scan_pins.py /path/to/patterns --pin-file /path/to/target.pin --channel-link --dry-run
+# Check and copy eligible bodies; preserve originals
+python scripts/check_scan_pins.py /path/to/patterns --pin-file /path/to/target.pin --channel-link
+```
+
+All files first undergo the direction-aware base check with its dpin exemption. Only PASS files with an underscore-delimited `body` filename token and **every ScanIn in scan_in, every ScanOut in scan_out** qualify. CHL has no dpin exemption: a pin requiring dpin to pass prevents classification, although the file can still PASS the base check. Overlap with dpin is allowed when the correct directional scan group also contains the pin. Setup files, failed checks and files without data pins are never copied. With custom `--groups`, the order is scan-in, scan-out, nonclk dpin; three distinct names are required.
+
+The version is extracted from a single `v<number>` token in the filename. For example:
+
+```text
+v1_TC100_G134/example_body_v1_TC100.stil.gz
+	-> v1_TC100_G134/v1_Channellink/example_body_v1_TC100_CHL.stil.gz
+```
+
+For recursive inputs, each file's own parent receives its output folder. Missing/ambiguous versions are reported instead of guessed. `.stil` and `.stil.gz` retain their format, bytes and contents. Only the copied filename changes; SHA256 is verified. Existing identical files are skipped as ALREADY_EXISTS; differing files are errors and never overwritten. No move or deletion of originals occurs.
+
+Check-only invocations report ELIGIBLE/SKIPPED (or a classification ERROR) without writing. Export mode reports COPIED/ALREADY_EXISTS/SKIPPED/ERROR; preview uses WOULD_COPY and does not validate existing destination contents. Membership and copy results are separate in JSON. Export errors cause exit 2 even when membership passes; successful copies in other files are retained. Missing ScanIn/ScanOut declarations remain informational, as in check-only mode.
 
 ### Optional pin-family selection
 
@@ -55,10 +78,12 @@ The token must be an underscore-separated part of the filename stem, e.g. `examp
 
 JSON includes a top-level `summary` and per-file `pins`, `absent_fields`, `clocks_info_only` and `error` entries.
 
+Each pin has `passed`, `failure`, `expected_group`, `allowed_groups`, `direction_matches` and actual `groups`. `passed=false` identifies a failure; a nonempty `groups` list does not imply success when direction is wrong. These direction-aware rules supersede the older union-only behavior; rerun previously passing inputs under the current rules.
+
 | Status | Meaning |
 |---|---|
-| PASS | At least one data pin was found and every declared data pin belongs to the allowed union |
-| FAIL | At least one declared data pin is missing from the allowed union |
+| PASS | At least one data pin was found and every declared data pin matches its direction or belongs to direction-free dpin |
+| FAIL | At least one declared data pin is missing or only belongs to the opposite directional group without dpin exemption |
 | UNDETERMINED | No declared data pins were found |
 | ERROR | Configuration, parsing, decompression or file-read failure |
 

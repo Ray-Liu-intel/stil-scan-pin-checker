@@ -2,9 +2,12 @@
 import argparse
 from collections import Counter
 import gzip
+import hashlib
 import json
+import os
 from pathlib import Path
 import re
+import shutil
 import sys
 
 DEFAULT_GROUPS = ('stm_scan_in', 'stm_scan_out', 'stm_scan_nonclk_dpin')
@@ -144,6 +147,11 @@ def scan_blocks(path):
 
 
 def check_file(path, groups):
+    # load_groups preserves --groups order: scan-in, scan-out, direction-free dpin.
+    if len(groups) != 3:
+        raise ParseError('Expected three distinct groups: scan-in, scan-out, nonclk dpin')
+    in_group, out_group, dp_group = groups
+    directional_groups = {'ScanIn': in_group, 'ScanOut': out_group}
     rows = []
     absent = []
     clocks = set()
@@ -176,15 +184,29 @@ def check_file(path, groups):
                         absent.append({'chain': name, 'field': role})
                     for field in fields:
                         raw = field[1].strip()
-                        pin = normalize(raw)
                         if role == 'ScanMasterClock':
-                            clocks.add(pin)
+                            # STIL permits a list of scan master clocks (IOD/CCD).
+                            offset = 0
+                            while offset < len(raw):
+                                clock = REF.match(raw, offset)
+                                if clock is None:
+                                    raise ParseError(f'Unsupported clock reference: {raw!r}')
+                                clocks.add(normalize(clock[0]))
+                                offset = clock.end()
                             continue
+                        pin = normalize(raw)
                         hits = [g for g, pins in groups.items() if pin in pins]
+                        expected = directional_groups[role]
+                        direction_matches = expected in hits
+                        passed = direction_matches or dp_group in hits
+                        failure = None if passed else ('DIRECTION_MISMATCH' if hits else 'PIN_NOT_FOUND')
                         rows.append({'chain': name, 'role': role, 'original': raw,
                                      'pin': pin, 'groups': hits,
+                                     'expected_group': expected, 'allowed_groups': [expected, dp_group],
+                                     'direction_matches': direction_matches, 'passed': passed,
+                                     'failure': failure,
                                      'line': first + text[:body_start + field.start()].count('\n')})
-        status = 'FAIL' if any(not row['groups'] for row in rows) else ('PASS' if rows else 'UNDETERMINED')
+        status = 'FAIL' if any(not row['passed'] for row in rows) else ('PASS' if rows else 'UNDETERMINED')
         error = None if rows else 'No declared scan data pins found'
     except (OSError, EOFError, UnicodeError, ValueError) as exc:
         status = 'ERROR'
@@ -192,6 +214,105 @@ def check_file(path, groups):
     return {'file': str(path), 'status': status, 'error': error,
             'blocks': blocks_count, 'chains': chains_count, 'pins': rows,
             'absent_fields': absent, 'clocks_info_only': sorted(clocks)}
+
+
+def pattern_parts(path):
+    """Keep the original extension spelling, including the complete .stil.gz suffix."""
+    name = Path(path).name
+    length = 8 if name.lower().endswith('.stil.gz') else 5
+    return name[:-length], name[-length:]
+
+
+def generated_path(path):
+    path = Path(path)
+    stem, _ = pattern_parts(path)
+    return (stem.upper().endswith('_CHL') or
+            any(p.lower().endswith('_channellink') for p in path.parts[:-1]))
+
+
+def find_inputs(path):
+    """Prune generated output folders, including on repeat recursive runs."""
+    path = Path(path)
+    if path.is_file():
+        candidates = [path]
+    else:
+        candidates = []
+        for folder, dirs, files in os.walk(path, followlinks=False):
+            dirs[:] = [d for d in dirs if not d.lower().endswith('_channellink')]
+            candidates.extend(Path(folder) / f for f in files)
+    return sorted(p for p in candidates if p.name.lower().endswith(('.stil', '.stil.gz'))
+                  and not generated_path(p))
+
+
+def channel_link_plan(result, io_groups):
+    path = Path(result['file'])
+    stem, suffix = pattern_parts(path)
+    plan = {'eligible': False, 'action': 'SKIPPED', 'destination': None}
+    if generated_path(path):
+        reason = 'Already a Channellink output'
+    elif not re.search(r'(?:^|_)body(?:_|$)', stem, re.I):
+        reason = 'Not a body filename'
+    elif re.search(r'(?:^|_)setup(?:_|$)', stem, re.I):
+        reason = 'Ambiguous body/setup filename'
+    elif result['status'] != 'PASS' or not result['pins']:
+        reason = 'Pin membership check did not PASS'
+    elif not all(io_groups[0 if row['role'] == 'ScanIn' else 1] in row['groups']
+                 for row in result['pins']):
+        reason = 'At least one data pin lacks its direction-matched scan group (dpin cannot qualify for CHL)'
+    else:
+        plan['eligible'] = True
+        versions = re.findall(r'(?:^|_)(v\d+)(?=_|$)', stem, re.I)
+        if len(versions) != 1:
+            plan.update(action='ERROR', reason='Expected exactly one v<number> filename token')
+            return plan
+        destination = path.parent / (versions[0].lower() + '_Channellink') / (stem + '_CHL' + suffix)
+        plan.update(action='ELIGIBLE', destination=str(destination),
+                    reason='Every ScanIn matches scan_in and every ScanOut matches scan_out')
+        return plan
+    plan['reason'] = reason
+    return plan
+
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with Path(path).open('rb') as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def export_channel_link(result, io_groups, dry_run=False):
+    """Copy eligible originals byte-for-byte; never overwrite an existing destination."""
+    plan = channel_link_plan(result, io_groups)
+    if plan['action'] != 'ELIGIBLE':
+        return plan
+    if dry_run:
+        plan['action'] = 'WOULD_COPY'
+        return plan
+    source = Path(result['file'])
+    destination = Path(plan['destination'])
+    created = False
+    try:
+        if source.is_symlink() or destination.parent.is_symlink() or destination.is_symlink():
+            raise OSError('Refusing symlink source or output')
+        expected = sha256(source)
+        if destination.exists():
+            if not destination.is_file() or sha256(destination) != expected:
+                raise OSError('Destination exists with different content; not overwritten')
+            plan.update(action='ALREADY_EXISTS', sha256=expected)
+            return plan
+        destination.parent.mkdir(exist_ok=True)
+        with source.open('rb') as incoming, destination.open('xb') as outgoing:
+            created = True
+            shutil.copyfileobj(incoming, outgoing, length=1024 * 1024)
+        if sha256(destination) != expected or sha256(source) != expected:
+            raise OSError('Copy verification failed or source changed during copy')
+        plan.update(action='COPIED', sha256=expected)
+    except OSError as exc:
+        if created:
+            destination.unlink(missing_ok=True)
+        plan.update(action='ERROR', reason=str(exc))
+    return plan
 
 
 def resolve_pin(args):
@@ -215,19 +336,31 @@ def main(argv=None):
     parser.add_argument('--stage', choices=('sort', 'class'))
     parser.add_argument('--die', type=str.upper, choices=('DRD', 'CCD', 'IOD'))
     parser.add_argument('--groups', nargs=3, default=DEFAULT_GROUPS)
+    parser.add_argument('--channel-link', action='store_true',
+                        help='Copy eligible body files into v<number>_Channellink beside each source')
+    parser.add_argument('--dry-run', action='store_true', help='Preview --channel-link without copying')
     args = parser.parse_args(argv)
+    if args.dry_run and not args.channel_link:
+        parser.error('--dry-run requires --channel-link')
     try:
         pin_file = resolve_pin(args)
         groups = load_groups(pin_file, args.groups)
-        paths = [args.input] if args.input.is_file() else sorted(args.input.rglob('*'))
-        paths = [p for p in paths if p.is_file() and p.name.lower().endswith(('.stil', '.stil.gz'))]
+        paths = find_inputs(args.input)
         if not paths:
             raise ParseError('No .stil or .stil.gz files found')
         results = [check_file(path, groups) for path in paths]
+        for result in results:
+            result['channel_link'] = (export_channel_link(result, args.groups[:2], args.dry_run)
+                                      if args.channel_link else channel_link_plan(result, args.groups[:2]))
         counts = dict(Counter(row['status'] for row in results))
         print(json.dumps({'pin_file': str(pin_file), 'group_sizes': {g: len(p) for g, p in groups.items()},
                           'normalization': 'uppercase; [n] -> _n', 'clock_checks': False,
+                          'direction_required': True, 'dpin_direction_exempt': True,
+                          'channel_link_requested': args.channel_link, 'dry_run': args.dry_run,
+                          'channel_link_summary': dict(Counter(r['channel_link']['action'] for r in results)),
                           'summary': counts, 'files': results}, indent=2))
+        if args.channel_link and any(r['channel_link']['action'] == 'ERROR' for r in results):
+            return 2
         if any(r['status'] in ('ERROR', 'UNDETERMINED') for r in results):
             return 2
         return 1 if counts.get('FAIL') else 0
