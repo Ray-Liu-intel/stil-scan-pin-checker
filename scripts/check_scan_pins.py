@@ -1,4 +1,4 @@
-"""Read-only STIL scan-data pin membership checker (Python 3.10+, stdlib only)."""
+"""STIL basic pin checker with opt-in IOD/CCD Channellink copies (Python 3.10+, stdlib only)."""
 import argparse
 from collections import Counter
 import gzip
@@ -227,6 +227,7 @@ def generated_path(path):
     path = Path(path)
     stem, _ = pattern_parts(path)
     return (stem.upper().endswith('_CHL') or
+            re.search(r'(?:^|_)sc_v\d+(?=_|$)', stem, re.I) is not None or
             any(p.lower().endswith('_channellink') for p in path.parts[:-1]))
 
 
@@ -244,7 +245,12 @@ def find_inputs(path):
                   and not generated_path(p))
 
 
-def channel_link_plan(result, io_groups):
+def channel_link_plan(result, io_groups, *, die):
+    if die == 'DRD':
+        return {'eligible': None, 'action': 'NOT_CHECKED', 'destination': None,
+                'reason': 'DRD policy: basic pin check only; Channellink is not evaluated'}
+    if die not in ('IOD', 'CCD'):
+        raise ParseError('Channellink requires an explicit IOD or CCD die')
     path = Path(result['file'])
     stem, suffix = pattern_parts(path)
     plan = {'eligible': False, 'action': 'SKIPPED', 'destination': None}
@@ -261,11 +267,13 @@ def channel_link_plan(result, io_groups):
         reason = 'At least one data pin lacks its direction-matched scan group (dpin cannot qualify for CHL)'
     else:
         plan['eligible'] = True
-        versions = re.findall(r'(?:^|_)(v\d+)(?=_|$)', stem, re.I)
+        versions = list(re.finditer(r'(?:^|_)(v\d+)(?=_|$)', stem, re.I))
         if len(versions) != 1:
             plan.update(action='ERROR', reason='Expected exactly one v<number> filename token')
             return plan
-        destination = path.parent / (versions[0].lower() + '_Channellink') / (stem + '_CHL' + suffix)
+        version = versions[0]
+        output_stem = stem[:version.start(1)] + 'sc_' + stem[version.start(1):]
+        destination = path.parent / (version[1].lower() + '_Channellink') / (output_stem + suffix)
         plan.update(action='ELIGIBLE', destination=str(destination),
                     reason='Every ScanIn matches scan_in and every ScanOut matches scan_out')
         return plan
@@ -281,9 +289,9 @@ def sha256(path):
     return digest.hexdigest()
 
 
-def export_channel_link(result, io_groups, dry_run=False):
+def export_channel_link(result, io_groups, dry_run=False, *, die):
     """Copy eligible originals byte-for-byte; never overwrite an existing destination."""
-    plan = channel_link_plan(result, io_groups)
+    plan = channel_link_plan(result, io_groups, die=die)
     if plan['action'] != 'ELIGIBLE':
         return plan
     if dry_run:
@@ -334,14 +342,17 @@ def main(argv=None):
     parser.add_argument('--pin-file', type=Path)
     parser.add_argument('--plt-dir', type=Path)
     parser.add_argument('--stage', choices=('sort', 'class'))
-    parser.add_argument('--die', type=str.upper, choices=('DRD', 'CCD', 'IOD'))
+    parser.add_argument('--die', type=str.upper, choices=('DRD', 'CCD', 'IOD'), required=True,
+                        help='DRD: basic only; IOD/CCD: basic plus Channellink eligibility')
     parser.add_argument('--groups', nargs=3, default=DEFAULT_GROUPS)
     parser.add_argument('--channel-link', action='store_true',
-                        help='Copy eligible body files into v<number>_Channellink beside each source')
+                        help='Opt in to IOD/CCD copies with _sc_v<number> names in source-parent/v<number>_Channellink')
     parser.add_argument('--dry-run', action='store_true', help='Preview --channel-link without copying')
     args = parser.parse_args(argv)
     if args.dry_run and not args.channel_link:
         parser.error('--dry-run requires --channel-link')
+    if args.channel_link and args.die == 'DRD':
+        parser.error('DRD is basic-only; omit --channel-link')
     try:
         pin_file = resolve_pin(args)
         groups = load_groups(pin_file, args.groups)
@@ -350,10 +361,11 @@ def main(argv=None):
             raise ParseError('No .stil or .stil.gz files found')
         results = [check_file(path, groups) for path in paths]
         for result in results:
-            result['channel_link'] = (export_channel_link(result, args.groups[:2], args.dry_run)
-                                      if args.channel_link else channel_link_plan(result, args.groups[:2]))
+            result['channel_link'] = (export_channel_link(result, args.groups[:2], args.dry_run, die=args.die)
+                                      if args.channel_link else channel_link_plan(result, args.groups[:2], die=args.die))
         counts = dict(Counter(row['status'] for row in results))
         print(json.dumps({'pin_file': str(pin_file), 'group_sizes': {g: len(p) for g, p in groups.items()},
+                          'die': args.die, 'channel_link_checks': args.die in ('IOD', 'CCD'),
                           'normalization': 'uppercase; [n] -> _n', 'clock_checks': False,
                           'direction_required': True, 'dpin_direction_exempt': True,
                           'channel_link_requested': args.channel_link, 'dry_run': args.dry_run,
